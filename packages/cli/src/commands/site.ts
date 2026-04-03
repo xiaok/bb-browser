@@ -25,7 +25,7 @@ import { execSync } from "node:child_process";
 const BB_DIR = join(homedir(), ".bb-browser");
 const LOCAL_SITES_DIR = join(BB_DIR, "sites");
 const COMMUNITY_SITES_DIR = join(BB_DIR, "bb-sites");
-const COMMUNITY_REPO = "https://github.com/epiral/bb-sites.git";
+const COMMUNITY_REPO = "https://github.com/xiaok/bb-sites.git";
 
 function checkCliUpdate(): void {
   try {
