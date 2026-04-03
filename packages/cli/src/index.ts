@@ -725,25 +725,8 @@ async function main(): Promise<void> {
    Save to ~/.bb-browser/sites/platform/command.js (private, takes priority)
    bb-browser site platform/command "test query" --json
 
-5. CONTRIBUTE
-   Option A (with gh CLI):
-     git clone https://github.com/epiral/bb-sites && cd bb-sites
-     git checkout -b feat-platform
-     # add adapter files
-     git push -u origin feat-platform
-     gh pr create --repo epiral/bb-sites
-
-   Option B (without gh CLI, using bb-browser itself):
-     bb-browser site github/fork epiral/bb-sites
-     git clone https://github.com/YOUR_USER/bb-sites && cd bb-sites
-     git checkout -b feat-platform
-     # add adapter files
-     git push -u origin feat-platform
-     bb-browser site github/pr-create epiral/bb-sites --title "feat(platform): add adapters" --head "YOUR_USER:feat-platform"
-
-Private adapters:  ~/.bb-browser/sites/<platform>/<command>.js
-Community:         ~/.bb-browser/bb-sites/ (via bb-browser site update)
-Full guide:        https://github.com/epiral/bb-sites/blob/main/SKILL.md`);
+ Private adapters:  ~/.bb-browser/sites/<platform>/<command>.js
+ Community:         ~/.bb-browser/bb-sites/ (via bb-browser site update)`);
         break;
       }
 

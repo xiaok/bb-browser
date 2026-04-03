@@ -37,7 +37,7 @@ bb-browser guide
 bb-browser site reddit/thread https://www.reddit.com/r/LocalLLaMA/comments/...
 
 # 命名参数（--flag value 格式）
-bb-browser site github/pr-create epiral/bb-sites --title "feat: ..." --head "user:branch"
+bb-browser site twitter/search "AI agent" --count 20
 
 # 混合使用
 bb-browser site twitter/search "AI agent" --count 20
@@ -131,7 +131,6 @@ adapter 返回 `{error: "...", hint: "..."}` 时，系统自动检测登录相�
 |------|---------|------|
 | GitHub | `site github/repo <owner/repo>` | 仓库信息 |
 | GitHub | `site github/issues <owner/repo>` | Issue 列表 |
-| GitHub | `site github/pr-create <repo> --title "..."` | 创建 PR |
 | StackOverflow | `site stackoverflow/search "query"` | 搜索 |
 | HackerNews | `site hackernews/top` | 热门帖子 |
 | CSDN | `site csdn/search "query"` | CSDN 搜索 |
