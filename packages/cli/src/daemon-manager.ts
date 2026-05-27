@@ -3,30 +3,20 @@
  */
 
 import { spawn } from "node:child_process";
-import { readFile, unlink } from "node:fs/promises";
-import { request as httpRequest } from "node:http";
+import { unlink } from "node:fs/promises";
 import { fileURLToPath } from "node:url";
 import { dirname, resolve } from "node:path";
 import { existsSync } from "node:fs";
-import os from "node:os";
-import path from "node:path";
 import type { Request, Response } from "@bb-browser/shared";
-import { COMMAND_TIMEOUT } from "@bb-browser/shared";
+import {
+  COMMAND_TIMEOUT,
+  DAEMON_JSON,
+  type DaemonInfo,
+  readDaemonJson,
+  isProcessAlive,
+  httpJson,
+} from "@bb-browser/shared";
 import { discoverCdpPort } from "./cdp-discovery.js";
-
-// ---------------------------------------------------------------------------
-// Paths & types
-// ---------------------------------------------------------------------------
-
-const DAEMON_DIR = process.env.BB_BROWSER_HOME || path.join(os.homedir(), ".bb-browser");
-const DAEMON_JSON = path.join(DAEMON_DIR, "daemon.json");
-
-interface DaemonInfo {
-  pid: number;
-  host: string;
-  port: number;
-  token: string;
-}
 
 // ---------------------------------------------------------------------------
 // Cached state
@@ -36,100 +26,8 @@ let cachedInfo: DaemonInfo | null = null;
 let daemonReady = false;
 
 // ---------------------------------------------------------------------------
-// PID liveness check
+// daemon.json helpers
 // ---------------------------------------------------------------------------
-
-/**
- * Check whether a process with the given PID is alive.
- * Uses signal 0 which doesn't actually send a signal — it just checks existence.
- */
-export function isProcessAlive(pid: number): boolean {
-  try {
-    process.kill(pid, 0);
-    return true;
-  } catch {
-    return false;
-  }
-}
-
-// ---------------------------------------------------------------------------
-// Low-level HTTP helpers
-// ---------------------------------------------------------------------------
-
-function httpJson<T>(
-  method: "GET" | "POST",
-  urlPath: string,
-  info: { host: string; port: number; token: string },
-  body?: unknown,
-  timeout = 5000,
-): Promise<T> {
-  return new Promise((resolve, reject) => {
-    const payload = body !== undefined ? JSON.stringify(body) : undefined;
-    const req = httpRequest(
-      {
-        hostname: info.host,
-        port: info.port,
-        path: urlPath,
-        method,
-        headers: {
-          Authorization: `Bearer ${info.token}`,
-          ...(payload
-            ? {
-                "Content-Type": "application/json",
-                "Content-Length": Buffer.byteLength(payload),
-              }
-            : {}),
-        },
-        timeout,
-      },
-      (res) => {
-        const chunks: Buffer[] = [];
-        res.on("data", (chunk: Buffer) => chunks.push(Buffer.from(chunk)));
-        res.on("end", () => {
-          const raw = Buffer.concat(chunks).toString("utf8");
-          if ((res.statusCode ?? 500) >= 400) {
-            reject(new Error(`Daemon HTTP ${res.statusCode}: ${raw}`));
-            return;
-          }
-          try {
-            resolve(JSON.parse(raw) as T);
-          } catch {
-            reject(new Error(`Invalid JSON from daemon: ${raw}`));
-          }
-        });
-      },
-    );
-    req.on("error", reject);
-    req.on("timeout", () => {
-      req.destroy();
-      reject(new Error("Daemon request timed out"));
-    });
-    if (payload) req.write(payload);
-    req.end();
-  });
-}
-
-// ---------------------------------------------------------------------------
-// daemon.json
-// ---------------------------------------------------------------------------
-
-async function readDaemonJson(): Promise<DaemonInfo | null> {
-  try {
-    const raw = await readFile(DAEMON_JSON, "utf8");
-    const info = JSON.parse(raw) as DaemonInfo;
-    if (
-      typeof info.pid === "number" &&
-      typeof info.host === "string" &&
-      typeof info.port === "number" &&
-      typeof info.token === "string"
-    ) {
-      return info;
-    }
-    return null;
-  } catch {
-    return null;
-  }
-}
 
 async function deleteDaemonJson(): Promise<void> {
   try {
@@ -161,14 +59,15 @@ export function getDaemonPath(): string {
  */
 export async function ensureDaemon(): Promise<void> {
   if (daemonReady && cachedInfo) {
-    // Quick re-check: is it still alive?
+    // Quick re-check: is it still alive and CDP connected?
     try {
-      await httpJson<{ running: boolean }>("GET", "/status", cachedInfo, undefined, 2000);
-      return;
-    } catch {
-      daemonReady = false;
-      cachedInfo = null;
-    }
+      const status = await httpJson<{ running?: boolean; cdpConnected?: boolean }>("GET", "/status", cachedInfo, undefined, 2000);
+      if (status.running && status.cdpConnected !== false) {
+        return;
+      }
+    } catch {}
+    daemonReady = false;
+    cachedInfo = null;
   }
 
   // Try reading existing daemon.json and checking if daemon is alive
@@ -178,17 +77,6 @@ export async function ensureDaemon(): Promise<void> {
     if (!isProcessAlive(info.pid)) {
       await deleteDaemonJson();
       info = null;
-    } else {
-      try {
-        const status = await httpJson<{ running?: boolean }>("GET", "/status", info, undefined, 2000);
-        if (status.running) {
-          cachedInfo = info;
-          daemonReady = true;
-          return;
-        }
-      } catch {
-        // Daemon process exists but HTTP not responding — fall through to spawn
-      }
     }
   }
 
@@ -199,14 +87,51 @@ export async function ensureDaemon(): Promise<void> {
       "bb-browser: Cannot find a Chromium-based browser.\n\n" +
       "Please do one of the following:\n" +
       "  1. Install Google Chrome, Edge, or Brave\n" +
-      "  2. Start Chrome with: google-chrome --remote-debugging-port=19825\n" +
+      "  2. Start Chrome with: google-chrome --remote-debugging-port=9222\n" +
       "  3. Set BB_BROWSER_CDP_URL=http://host:port",
     );
   }
 
+  // If existing daemon has wrong CDP port, stop it and respawn
+  if (info && info.cdpPort !== cdpInfo.port) {
+    await stopDaemon();
+    info = null;
+    // Fall through to spawn new daemon
+  }
+
+  // If existing daemon is alive and healthy, reuse it
+  if (info) {
+    try {
+      const status = await httpJson<{ running?: boolean; cdpConnected?: boolean }>("GET", "/status", info, undefined, 2000);
+      if (status.running && status.cdpConnected !== false) {
+        cachedInfo = info;
+        daemonReady = true;
+        return;
+      }
+      if (status.running && status.cdpConnected === false) {
+        await stopDaemon();
+        info = null;
+      }
+    } catch {
+      // Daemon process exists but HTTP not responding — stop and respawn
+      await stopDaemon();
+      info = null;
+    }
+  }
+
   // Spawn daemon process with discovered CDP endpoint
   const daemonPath = getDaemonPath();
-  const child = spawn(process.execPath, [daemonPath, "--cdp-host", cdpInfo.host, "--cdp-port", String(cdpInfo.port)], {
+  const daemonArgs = [daemonPath, "--cdp-host", cdpInfo.host, "--cdp-port", String(cdpInfo.port)];
+
+  // Forward --hub flags from environment variables
+  const hubUrl = process.env.BB_BROWSER_HUB_URL || process.env.PINIX_HUB_URL;
+  const hubToken = process.env.BB_BROWSER_HUB_TOKEN || process.env.PINIX_HUB_TOKEN || process.env.PINIX_TOKEN;
+  if (hubUrl) {
+    daemonArgs.push("--hub", hubUrl);
+    if (hubToken) daemonArgs.push("--hub-token", hubToken);
+  }
+
+  const child = spawn(process.execPath, daemonArgs, {
     detached: true,
     stdio: "ignore",
   });
@@ -252,19 +177,39 @@ export async function daemonCommand(request: Request): Promise<Response> {
 }
 
 /**
- * Stop the daemon via POST /shutdown.
+ * Stop the daemon gracefully, with force-kill fallback.
+ *
+ * 1. Try graceful shutdown via HTTP POST /shutdown
+ * 2. Wait for daemon.json to disappear (daemon cleans it up on exit)
+ * 3. Force-kill if still alive after timeout
  */
 export async function stopDaemon(): Promise<boolean> {
   const info = cachedInfo ?? (await readDaemonJson());
   if (!info) return false;
+
+  daemonReady = false;
+  cachedInfo = null;
+
+  // Try graceful shutdown via HTTP
   try {
-    await httpJson("POST", "/shutdown", info);
-    daemonReady = false;
-    cachedInfo = null;
-    return true;
-  } catch {
-    return false;
+    await httpJson("POST", "/shutdown", info, undefined, 3000);
+  } catch {}
+
+  // Wait for daemon.json to disappear (daemon cleans it up on shutdown)
+  const deadline = Date.now() + 5000;
+  while (Date.now() < deadline) {
+    if (!existsSync(DAEMON_JSON)) return true;
+    await new Promise((r) => setTimeout(r, 200));
   }
+
+  // Force kill if still alive
+  if (isProcessAlive(info.pid)) {
+    try {
+      process.kill(info.pid, "SIGKILL");
+    } catch {}
+  }
+  await deleteDaemonJson();
+  return true;
 }
 
 /**

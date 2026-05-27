@@ -1,15 +1,16 @@
 {
   "name": "bb-browser",
-  "version": "0.11.2",
-  "description": "Your browser is the API. CLI + MCP server for AI agents to control Chrome with your login state.",
+  "version": "0.13.3",
+  "description": "Your browser is the API. CLI for AI agents to control Chrome with your login state.",
   "type": "module",
   "bin": {
     "bb-browser": "./dist/cli.js",
-    "bb-browser-mcp": "./dist/mcp.js"
+    "bb-browser-daemon": "./dist/daemon.js"
   },
   "main": "./dist/cli.js",
   "files": [
     "dist",
+    "web",
     "packages/shared/buildDomTree.js",
     "README.md",
     "LICENSE"
@@ -34,8 +35,7 @@
     "cli",
     "puppeteer",
     "playwright",
-    "cdp",
-    "mcp"
+    "cdp"
   ],
   "author": "",
   "license": "MIT",
@@ -55,16 +55,16 @@
     "@bufbuild/protobuf": "^2.11.0",
     "@connectrpc/connect": "^2.1.1",
     "@connectrpc/connect-node": "^2.1.1",
-    "@modelcontextprotocol/sdk": "^1.12.1",
+    "@pinixai/hub-client": "^0.2.0",
     "ajv": "^8.17.1",
     "ajv-formats": "^3.0.1",
     "ws": "^8.18.0"
   },
   "devDependencies": {
-    "husky": "^9.1.7",
     "@eslint/js": "^9.23.0",
     "eslint": "^9.23.0",
     "globals": "^16.0.0",
+    "husky": "^9.1.7",
     "tsup": "^8.0.0",
     "tsx": "^4.20.6",
     "turbo": "^2.3.0",

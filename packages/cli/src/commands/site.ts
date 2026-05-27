@@ -8,15 +8,18 @@
  *   bb-browser site run <name> [args...]      运行
  *   bb-browser site update                    更新社区 adapter 库
  *
+ * Site adapter execution is handled by the daemon. The CLI sends
+ * site_list / site_search / site_info / site_run commands to the daemon
+ * and formats the output.
+ *
  * 目录：
  *   ~/.bb-browser/sites/       私有 adapter（优先）
  *   ~/.bb-browser/bb-sites/    社区 adapter（bb-browser site update 拉取）
  */
 
-import { generateId, type Request, type Response, type TabInfo } from "@bb-browser/shared";
+import type { Request, Response } from "@bb-browser/shared";
 import { handleJqResponse, sendCommand } from "../client.js";
 import { getHistoryDomains } from "../history-sqlite.js";
-import { ensureDaemonRunning } from "../daemon-manager.js";
 import { readFileSync, readdirSync, existsSync, mkdirSync } from "node:fs";
 import { join, relative } from "node:path";
 import { homedir } from "node:os";
@@ -209,21 +212,31 @@ function getAllSites(): SiteMeta[] {
 }
 
 /**
- * 精确匹配 tab 的 origin
+ * Find a site adapter JS file locally by name (for openclaw fallback).
  */
-function matchTabOrigin(tabUrl: string, domain: string): boolean {
-  try {
-    const tabOrigin = new URL(tabUrl).hostname;
-    return tabOrigin === domain || tabOrigin.endsWith("." + domain);
-  } catch {
-    return false;
-  }
+function findLocalSiteFile(name: string): string | null {
+  const sites = getAllSites();
+  const site = sites.find(s => s.name === name);
+  return site?.filePath ?? null;
 }
 
 // ── 子命令 ──────────────────────────────────────────────────────
 
-function siteList(options: SiteOptions): void {
-  const sites = getAllSites();
+async function siteList(options: SiteOptions): Promise<void> {
+  const resp: Response = await sendCommand({
+    method: "site_list",
+  } as Request);
+
+  if (resp.error) {
+    if (options.json) {
+      exitJsonError(resp.error.message || "site_list failed");
+    }
+    console.error(`[error] site list: ${resp.error.message || "failed"}`);
+    process.exit(1);
+  }
+
+  const sites: Array<{ name: string; description: string; domain: string; source: string }> =
+    (resp.result as any)?.sites || [];
 
   if (sites.length === 0) {
     if (options.json) {
@@ -237,14 +250,11 @@ function siteList(options: SiteOptions): void {
   }
 
   if (options.json) {
-    console.log(JSON.stringify(sites.map(s => ({
-      name: s.name, description: s.description, domain: s.domain,
-      args: s.args, source: s.source,
-    })), null, 2));
+    console.log(JSON.stringify(sites, null, 2));
     return;
   }
 
-  const groups = new Map<string, SiteMeta[]>();
+  const groups = new Map<string, typeof sites>();
   for (const s of sites) {
     const platform = s.name.split("/")[0];
     if (!groups.has(platform)) groups.set(platform, []);
@@ -263,14 +273,22 @@ function siteList(options: SiteOptions): void {
   console.log();
 }
 
-function siteSearch(query: string, options: SiteOptions): void {
-  const sites = getAllSites();
-  const q = query.toLowerCase();
-  const matches = sites.filter(s =>
-    s.name.toLowerCase().includes(q) ||
-    s.description.toLowerCase().includes(q) ||
-    s.domain.toLowerCase().includes(q)
-  );
+async function siteSearch(query: string, options: SiteOptions): Promise<void> {
+  const resp: Response = await sendCommand({
+    method: "site_search",
+    query,
+  } as Request);
+
+  if (resp.error) {
+    if (options.json) {
+      exitJsonError(resp.error.message || "site_search failed");
+    }
+    console.error(`[error] site search: ${resp.error.message || "failed"}`);
+    process.exit(1);
+  }
+
+  const matches: Array<{ name: string; description: string; domain: string; source: string }> =
+    (resp.result as any)?.sites || [];
 
   if (matches.length === 0) {
     if (options.json) {
@@ -283,9 +301,7 @@ function siteSearch(query: string, options: SiteOptions): void {
   }
 
   if (options.json) {
-    console.log(JSON.stringify(matches.map(s => ({
-      name: s.name, description: s.description, domain: s.domain, source: s.source,
-    })), null, 2));
+    console.log(JSON.stringify(matches, null, 2));
     return;
   }
 
@@ -362,33 +378,28 @@ function siteUpdate(options: SiteOptions = {}): void {
   checkCliUpdate();
 }
 
-function findSiteByName(name: string): SiteMeta | undefined {
-  return getAllSites().find((site) => site.name === name);
-}
+async function siteInfo(name: string, options: SiteOptions): Promise<void> {
+  const resp: Response = await sendCommand({
+    method: "site_info",
+    siteName: name,
+  } as Request);
 
-function siteInfo(name: string, options: SiteOptions): void {
-  const site = findSiteByName(name);
-
-  if (!site) {
+  if (resp.error) {
     if (options.json) {
-      exitJsonError(`adapter "${name}" not found`, { action: "bb-browser site list" });
+      exitJsonError(resp.error.message || `adapter "${name}" not found`, { action: "bb-browser site list" });
     }
-    console.error(`[error] site info: adapter "${name}" not found.`);
+    console.error(`[error] site info: ${resp.error.message || `adapter "${name}" not found`}.`);
     console.error("  Try: bb-browser site list");
     process.exit(1);
   }
 
-  const meta = {
-    name: site.name,
-    description: site.description,
-    domain: site.domain,
-    args: site.args,
-    example: site.example,
-    readOnly: site.readOnly,
-  };
+  const site = resp.result as any;
 
   if (options.json) {
-    console.log(JSON.stringify(meta, null, 2));
+    console.log(JSON.stringify({
+      name: site.name, description: site.description, domain: site.domain,
+      args: site.args, example: site.example, readOnly: site.readOnly,
+    }, null, 2));
     return;
   }
 
@@ -396,20 +407,21 @@ function siteInfo(name: string, options: SiteOptions): void {
   console.log();
   console.log("参数：");
 
-  const argEntries = Object.entries(site.args);
+  const argEntries = Object.entries(site.args || {});
   if (argEntries.length === 0) {
     console.log("  （无）");
   } else {
     for (const [argName, argDef] of argEntries) {
-      const requiredText = argDef.required ? "必填" : "可选";
-      const description = argDef.description || "";
+      const ad = argDef as { required?: boolean; description?: string };
+      const requiredText = ad.required ? "必填" : "可选";
+      const description = ad.description || "";
       console.log(`  ${argName} (${requiredText})    ${description}`.trimEnd());
     }
   }
 
   console.log();
   console.log("示例：");
-  console.log(`  ${site.example || `bb-browser site ${site.name}`}`);
+  console.log(`  ${site.example || `bb-browser site ${name}`}`);
   console.log();
   console.log(`域名：${site.domain || "（未声明）"}`);
   console.log(`只读：${site.readOnly ? "是" : "否"}`);
@@ -458,7 +470,7 @@ async function siteRecommend(options: SiteOptions): Promise<void> {
   };
 
   if (options.jq) {
-    handleJqResponse({ id: generateId(), success: true, data: jsonData as any });
+    handleJqResponse({ result: jsonData as any });
   }
 
   if (options.json) {
@@ -502,87 +514,56 @@ async function siteRun(
   args: string[],
   options: SiteOptions
 ): Promise<void> {
-  const sites = getAllSites();
-  const site = sites.find(s => s.name === name);
-
-  if (!site) {
-    const fuzzy = sites.filter(s => s.name.includes(name));
-    if (options.json) {
-      exitJsonError(`site "${name}" not found`, {
-        suggestions: fuzzy.slice(0, 5).map(s => s.name),
-        action: fuzzy.length > 0 ? undefined : "bb-browser site update",
-      });
-    }
-    console.error(`[error] site: "${name}" not found.`);
-    if (fuzzy.length > 0) {
-      console.error("  Did you mean:");
-      for (const s of fuzzy.slice(0, 5)) {
-        console.error(`    bb-browser site ${s.name}`);
-      }
-    } else {
-      console.error("  Try: bb-browser site list");
-      console.error("  Or:  bb-browser site update");
-    }
-    process.exit(1);
-  }
-
-  // 解析参数
-  const argNames = Object.keys(site.args);
-  const argMap: Record<string, string> = {};
-
-  // 过滤掉 --flag value 对，收集位置参数
-  const positionalArgs: string[] = [];
-  for (let i = 0; i < args.length; i++) {
-    if (args[i].startsWith("--")) {
-      const flagName = args[i].slice(2);
-      if (flagName in site.args && args[i + 1]) {
-        argMap[flagName] = args[i + 1];
-        i++; // 跳过值
-      }
-    } else {
-      positionalArgs.push(args[i]);
-    }
-  }
-
-  // 位置参数按 argNames 顺序填入（跳过已通过 --flag 提供的）
-  let posIdx = 0;
-  for (const argName of argNames) {
-    if (!argMap[argName] && posIdx < positionalArgs.length) {
-      argMap[argName] = positionalArgs[posIdx++];
-    }
-  }
-
-  // 只检查 required 参数
-  for (const [argName, argDef] of Object.entries(site.args)) {
-    if (argDef.required && !argMap[argName]) {
-      const usage = argNames.map(a => {
-        const def = site.args[a];
-        return def.required ? `<${a}>` : `[${a}]`;
-      }).join(" ");
+  // OpenClaw path — alternative execution, kept in CLI
+  if (options.openclaw) {
+    // Need site meta for openclaw path — fetch from daemon
+    const infoResp: Response = await sendCommand({
+      method: "site_info",
+      siteName: name,
+    } as Request);
+    const site = infoResp.result ? (infoResp.result as any) : null;
+    if (!site) {
       if (options.json) {
-        exitJsonError(`missing required argument "${argName}"`, {
-          usage: `bb-browser site ${name} ${usage}`,
-          example: site.example,
-        });
+        exitJsonError(`site "${name}" not found`, { action: "bb-browser site list" });
       }
-      console.error(`[error] site ${name}: missing required argument "${argName}".`);
-      console.error(`  Usage: bb-browser site ${name} ${usage}`);
-      if (site.example) console.error(`  Example: ${site.example}`);
+      console.error(`[error] site: "${name}" not found.`);
+      console.error("  Try: bb-browser site list");
       process.exit(1);
     }
-  }
 
-  // 读取并解析 JS
-  const jsContent = readFileSync(site.filePath, "utf-8");
+    // Parse args for openclaw (need arg names from site meta)
+    const argNames = Object.keys(site.args || {});
+    const argMap: Record<string, string> = {};
+    const positionalArgs: string[] = [];
+    for (let i = 0; i < args.length; i++) {
+      if (args[i].startsWith("--")) {
+        const flagName = args[i].slice(2);
+        if (flagName in (site.args || {}) && args[i + 1]) {
+          argMap[flagName] = args[i + 1];
+          i++;
+        }
+      } else {
+        positionalArgs.push(args[i]);
+      }
+    }
+    let posIdx = 0;
+    for (const argName of argNames) {
+      if (!argMap[argName] && posIdx < positionalArgs.length) {
+        argMap[argName] = positionalArgs[posIdx++];
+      }
+    }
 
-  // 移除 /* @meta ... */ 块，保留函数体
-  const jsBody = jsContent.replace(/\/\*\s*@meta[\s\S]*?\*\//, "").trim();
+    // Fetch JS content from daemon is not feasible, so read locally for openclaw
+    // This is a CLI-only fallback path
+    const siteJsPath = findLocalSiteFile(name);
+    if (!siteJsPath) {
+      exitJsonError(`Cannot find JS file for "${name}" locally (openclaw requires local files)`);
+    }
 
-  // 构造执行脚本
-  const argsJson = JSON.stringify(argMap);
-  const script = `(${jsBody})(${argsJson})`;
+    const jsContent = readFileSync(siteJsPath, "utf-8");
+    const jsBody = jsContent.replace(/\/\*\s*@meta[\s\S]*?\*\//, "").trim();
+    const argsJson = JSON.stringify(argMap);
 
-  if (options.openclaw) {
     const { ocGetTabs, ocFindTabByDomain, ocOpenTab, ocEvaluate } = await import("../openclaw-bridge.js");
 
     let targetId: string;
@@ -618,7 +599,7 @@ async function siteRun(
       const reportHint = `If this is an adapter bug, report via: gh issue create --repo epiral/bb-sites --title "[${name}] <description>" OR: bb-browser site github/issue-create epiral/bb-sites --title "[${name}] <description>"`;
 
       if (options.json) {
-        console.log(JSON.stringify({ id: "openclaw", success: false, error: errObj.error, hint, reportHint }));
+        console.log(JSON.stringify({ error: { message: errObj.error }, hint, reportHint }));
       } else {
         console.error(`[error] site ${name}: ${errObj.error}`);
         if (hint) console.error(`  Hint: ${hint}`);
@@ -636,71 +617,87 @@ async function siteRun(
         console.log(typeof r === "string" ? r : JSON.stringify(r));
       }
     } else if (options.json) {
-      console.log(JSON.stringify({ id: "openclaw", success: true, data: parsed }));
+      console.log(JSON.stringify({ result: parsed }));
     } else {
       console.log(JSON.stringify(parsed, null, 2));
     }
     return;
   }
 
-  await ensureDaemonRunning();
+  // --- Main path: parse CLI args and send site_run to daemon ---
 
-  // 确定目标 tab
-  let targetTabId: number | undefined = options.tabId;
+  // We need arg names to map positional args → named args.
+  // Fetch site meta from daemon first.
+  const infoResp: Response = await sendCommand({
+    method: "site_info",
+    siteName: name,
+  } as Request);
 
-  // 如果用户没指定 --tab，自动查找匹配域名的 tab
-  if (!targetTabId && site.domain) {
-    const listReq: Request = { id: generateId(), action: "tab_list" };
-    const listResp: Response = await sendCommand(listReq);
+  // Build argMap from CLI args
+  const argMap: Record<string, string> = {};
 
-    if (listResp.success && listResp.data?.tabs) {
-      const matchingTab = listResp.data.tabs.find((tab: TabInfo) =>
-        matchTabOrigin(tab.url, site.domain)
-      );
-      if (matchingTab) {
-        targetTabId = matchingTab.tabId;
+  if (infoResp.result) {
+    const site = infoResp.result as any;
+    const argNames = Object.keys(site.args || {});
+
+    const positionalArgs: string[] = [];
+    for (let i = 0; i < args.length; i++) {
+      if (args[i].startsWith("--")) {
+        const flagName = args[i].slice(2);
+        if (flagName in (site.args || {}) && args[i + 1]) {
+          argMap[flagName] = args[i + 1];
+          i++;
+        }
+      } else {
+        positionalArgs.push(args[i]);
       }
     }
 
-    if (!targetTabId) {
-      const newResp = await sendCommand({
-        id: generateId(),
-        action: "tab_new",
-        url: `https://${site.domain}`,
-      });
-      targetTabId = newResp.data?.tabId;
-      await new Promise((resolve) => setTimeout(resolve, 3000));
+    let posIdx = 0;
+    for (const argName of argNames) {
+      if (!argMap[argName] && posIdx < positionalArgs.length) {
+        argMap[argName] = positionalArgs[posIdx++];
+      }
+    }
+  } else {
+    // Site not found — still try sending to daemon (it will produce a proper error)
+    // Parse args as simple --key value pairs
+    for (let i = 0; i < args.length; i++) {
+      if (args[i].startsWith("--") && args[i + 1]) {
+        argMap[args[i].slice(2)] = args[i + 1];
+        i++;
+      }
     }
   }
 
-  // 执行
-  const evalReq: Request = { id: generateId(), action: "eval", script, tabId: targetTabId };
-  const evalResp: Response = await sendCommand(evalReq);
+  // Send site_run to daemon
+  const resp: Response = await sendCommand({
+    method: "site_run",
+    siteName: name,
+    siteArgs: argMap,
+    ...(options.tabId !== undefined ? { tabId: options.tabId } : {}),
+  } as Request);
 
-  if (!evalResp.success) {
-    const hint = site.domain
-      ? `Open https://${site.domain} in your browser, make sure you are logged in, then retry.`
-      : undefined;
+  if (resp.error) {
     if (options.json) {
-      console.log(JSON.stringify({ id: evalReq.id, success: false, error: evalResp.error || "eval failed", hint }));
+      console.log(JSON.stringify({ error: { message: resp.error.message || "site_run failed" } }));
     } else {
-      console.error(`[error] site ${name}: ${evalResp.error || "eval failed"}`);
-      if (hint) console.error(`  Hint: ${hint}`);
+      console.error(`[error] site ${name}: ${resp.error.message || "site_run failed"}`);
     }
     process.exit(1);
   }
 
-  const result = evalResp.data?.result;
+  const result = resp.result?.result;
   if (result === undefined || result === null) {
     if (options.json) {
-      console.log(JSON.stringify({ id: evalReq.id, success: true, data: null }));
+      console.log(JSON.stringify({ result: null }));
     } else {
       console.log("(no output)");
     }
     return;
   }
 
-  // 解析输出
+  // Parse output
   let parsed: unknown;
   try {
     parsed = typeof result === "string" ? JSON.parse(result) : result;
@@ -708,21 +705,21 @@ async function siteRun(
     parsed = result;
   }
 
-  // 检查 adapter 返回的 error
+  // Check for adapter-returned error
   if (typeof parsed === "object" && parsed !== null && "error" in parsed) {
     const errObj = parsed as { error: string; hint?: string };
-
-    // 检测是否为登录问题（检查 error 和 hint 文本）
     const checkText = `${errObj.error} ${errObj.hint || ""}`;
     const isAuthError = /401|403|unauthorized|forbidden|not.?logged|login.?required|sign.?in|auth/i.test(checkText);
-    const loginHint = isAuthError && site.domain
-      ? `Please log in to https://${site.domain} in your browser first, then retry.`
+    // Try to get domain from info resp
+    const domain = infoResp.result ? (infoResp.result as any)?.domain : undefined;
+    const loginHint = isAuthError && domain
+      ? `Please log in to https://${domain} in your browser first, then retry.`
       : undefined;
     const hint = loginHint || errObj.hint;
     const reportHint = `If this is an adapter bug, report via: gh issue create --repo epiral/bb-sites --title "[${name}] <description>" OR: bb-browser site github/issue-create epiral/bb-sites --title "[${name}] <description>"`;
 
     if (options.json) {
-      console.log(JSON.stringify({ id: evalReq.id, success: false, error: errObj.error, hint, reportHint }));
+      console.log(JSON.stringify({ error: { message: errObj.error }, hint, reportHint }));
     } else {
       console.error(`[error] site ${name}: ${errObj.error}`);
       if (hint) console.error(`  Hint: ${hint}`);
@@ -734,14 +731,13 @@ async function siteRun(
 
   if (options.jq) {
     const { applyJq } = await import("../jq.js");
-    // Tolerate ".data." prefix — Agent may copy from --json envelope structure
     const expr = options.jq.replace(/^\.data\./, '.');
     const results = applyJq(parsed, expr);
     for (const r of results) {
       console.log(typeof r === "string" ? r : JSON.stringify(r));
     }
   } else if (options.json) {
-    console.log(JSON.stringify({ id: evalReq.id, success: true, data: parsed }));
+    console.log(JSON.stringify({ result: parsed }));
   } else {
     console.log(JSON.stringify(parsed, null, 2));
   }
@@ -785,14 +781,14 @@ export async function siteCommand(
   }
 
   switch (subCommand) {
-    case "list":   siteList(options); break;
+    case "list":   await siteList(options); break;
     case "search":
       if (!args[1]) {
         console.error("[error] site search: <query> is required.");
         console.error("  Usage: bb-browser site search <query>");
         process.exit(1);
       }
-      siteSearch(args[1], options);
+      await siteSearch(args[1], options);
       break;
     case "info":
       if (!args[1]) {
@@ -800,7 +796,7 @@ export async function siteCommand(
         console.error("  Usage: bb-browser site info <name>");
         process.exit(1);
       }
-      siteInfo(args[1], options);
+      await siteInfo(args[1], options);
       break;
     case "recommend":
       await siteRecommend(options);

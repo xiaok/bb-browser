@@ -5,7 +5,7 @@ import os from "node:os";
 import path from "node:path";
 import { parseOpenClawJson } from "./openclaw-json.js";
 
-const DEFAULT_CDP_PORT = 19825;
+const DEFAULT_CDP_PORT = 9222;
 const MANAGED_BROWSER_DIR = path.join(os.homedir(), ".bb-browser", "browser");
 const MANAGED_USER_DATA_DIR = path.join(MANAGED_BROWSER_DIR, "user-data");
 const MANAGED_PORT_FILE = path.join(MANAGED_BROWSER_DIR, "cdp-port");
@@ -177,6 +177,7 @@ export async function launchManagedBrowser(port: number = DEFAULT_CDP_PORT): Pro
     "--disable-features=Translate,MediaRouter",
     "--disable-session-crashed-bubble",
     "--hide-crash-restore-bubble",
+    "--use-mock-keychain",
     "about:blank",
   ];
 

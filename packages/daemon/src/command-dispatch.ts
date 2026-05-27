@@ -5,8 +5,9 @@
  * CdpConnection + TabStateManager for per-tab state and seq tracking.
  */
 
-import { readFileSync } from "node:fs";
+import { readFileSync, mkdirSync, writeFileSync } from "node:fs";
 import path from "node:path";
+import os from "node:os";
 import { fileURLToPath } from "node:url";
 import type {
   Request,
@@ -19,6 +20,7 @@ import type {
 } from "@bb-browser/shared";
 import { CdpConnection, type CdpTargetInfo } from "./cdp-connection.js";
 import type { TabState } from "./tab-state.js";
+import { getAllSites, executeSiteAdapter } from "./site-adapter.js";
 
 // ---------------------------------------------------------------------------
 // Types
@@ -72,12 +74,12 @@ type ExtResponseData = Omit<ResponseData, "tabs" | "frameInfo"> & {
   };
 };
 
-function ok(id: string, data?: ExtResponseData): Response {
-  return { id, success: true, data: data as ResponseData };
+function ok(data?: ExtResponseData): Response {
+  return { result: data as ResponseData };
 }
 
-function fail(id: string, error: unknown): Response {
-  return { id, success: false, error: buildRequestError(error).message };
+function fail(error: unknown): Response {
+  return { error: { message: buildRequestError(error).message } };
 }
 
 // ---------------------------------------------------------------------------
@@ -231,6 +233,15 @@ function convertBuildDomTreeResult(
   walk(rootId, 0);
   return { snapshot: lines.join("\n"), refs };
 }
+
+const CLEANUP_HIGHLIGHTS_SCRIPT = `(() => {
+  if (window._highlightCleanupFunctions && window._highlightCleanupFunctions.length) {
+    window._highlightCleanupFunctions.forEach(fn => { try { fn(); } catch {} });
+    window._highlightCleanupFunctions = [];
+  }
+  const c = document.getElementById('playwright-highlight-container');
+  if (c) c.remove();
+})()`;
 
 async function buildSnapshot(
   cdp: CdpConnection,
@@ -494,6 +505,77 @@ let traceRecording = false;
 const traceEvents: TraceEvent[] = [];
 
 // ---------------------------------------------------------------------------
+// Domain-based tab routing
+// ---------------------------------------------------------------------------
+
+/**
+ * Check if a tab's URL hostname matches a domain (exact or subdomain).
+ */
+function matchTabDomain(tabUrl: string, domain: string): boolean {
+  try {
+    const hostname = new URL(tabUrl).hostname;
+    return hostname === domain || hostname.endsWith("." + domain);
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Resolve a tab by domain: find an existing tab matching the domain, or
+ * create a new one.  Returns the targetId, shortId, and TabState.
+ */
+async function resolveTabByDomain(
+  cdp: CdpConnection,
+  domain: string,
+): Promise<{ targetId: string; shortId: string; tab: TabState }> {
+  // Search existing tabs for a hostname match
+  const targets = (await cdp.getTargets()).filter(t => t.type === "page");
+  for (const t of targets) {
+    if (matchTabDomain(t.url, domain)) {
+      await cdp.attachAndEnable(t.id);
+      const tabState = cdp.tabManager.getTab(t.id);
+      if (tabState) {
+        return { targetId: t.id, shortId: tabState.shortId, tab: tabState };
+      }
+    }
+  }
+
+  // No matching tab — create one and wait for initial load
+  const created = await cdp.browserCommand<{ targetId: string }>(
+    "Target.createTarget",
+    { url: `https://${domain}` },
+  );
+  await cdp.attachAndEnable(created.targetId);
+
+  // Wait for the page to reach a loadable state (DOMContentLoaded or timeout)
+  const LOAD_TIMEOUT = 10_000;
+  await Promise.race([
+    new Promise<void>(resolve => {
+      const check = (): void => {
+        const tab = cdp.tabManager.getTab(created.targetId);
+        // Consider loaded once the TabStateManager has tracked the new target
+        if (tab) {
+          resolve();
+          return;
+        }
+        setTimeout(check, 200);
+      };
+      // Give CDP events a tick to propagate the new target
+      setTimeout(check, 500);
+    }),
+    new Promise<void>(resolve => setTimeout(resolve, LOAD_TIMEOUT)),
+  ]);
+
+  // Additional settle time for JS-heavy pages
+  await new Promise(resolve => setTimeout(resolve, 2000));
+
+  const tabState = cdp.tabManager.getTab(created.targetId);
+  if (!tabState) throw new Error(`Failed to create tab for domain: ${domain}`);
+
+  return { targetId: created.targetId, shortId: tabState.shortId, tab: tabState };
+}
+
+// ---------------------------------------------------------------------------
 // Main dispatch
 // ---------------------------------------------------------------------------
 
@@ -510,7 +592,7 @@ export async function dispatchRequest(
 
   // tab_new must work even when there are no existing tabs,
   // so handle it before ensurePageTarget().
-  if (request.action === "tab_new") {
+  if (request.method === "tab_new") {
     const url = request.url ?? "about:blank";
     const created = await cdp.browserCommand<{ targetId: string }>(
       "Target.createTarget",
@@ -518,12 +600,33 @@ export async function dispatchRequest(
     );
     await cdp.attachAndEnable(created.targetId);
     const newTab = cdp.tabManager.getTab(created.targetId);
-    return ok(request.id, {
+    return ok({
       tabId: created.targetId,
       url,
       tab: newTab?.shortId ?? created.targetId.slice(-4).toLowerCase(),
       seq: newTab?.recordAction(),
     });
+  }
+
+  // eval with domain routing: resolve tab by domain before ensurePageTarget,
+  // because there may be no existing tabs yet.
+  if (request.method === "eval" && request.domain && tabRef === undefined) {
+    if (!request.script) return fail("Missing script parameter");
+    try {
+      const resolved = await resolveTabByDomain(cdp, request.domain);
+      const seq = resolved.tab.recordAction();
+
+      let script = request.script;
+      if (request.args !== undefined) {
+        const argsJson = JSON.stringify(request.args);
+        script = `(async function(){return (${script})(${argsJson});})()`;
+      }
+
+      const result = await cdp.evaluate<unknown>(resolved.targetId, script, true);
+      return ok({ result, tab: resolved.shortId, seq });
+    } catch (error) {
+      return fail(error);
+    }
   }
 
   const target = await cdp.ensurePageTarget(
@@ -534,12 +637,12 @@ export async function dispatchRequest(
 
   const shortId = tab.shortId;
 
-  switch (request.action) {
+  switch (request.method) {
     // -----------------------------------------------------------------------
     // Navigation
     // -----------------------------------------------------------------------
     case "open": {
-      if (!request.url) return fail(request.id, "Missing url parameter");
+      if (!request.url) return fail("Missing url parameter");
       const seq = tab.recordAction();
       if (tabRef === undefined) {
         // No specific tab requested — open in new tab
@@ -549,7 +652,7 @@ export async function dispatchRequest(
         );
         const newTarget = await cdp.ensurePageTarget(created.targetId);
         const newTab = cdp.tabManager.getTab(newTarget.id);
-        return ok(request.id, {
+        return ok({
           url: request.url,
           tabId: newTarget.id,
           tab: newTab?.shortId ?? shortId,
@@ -558,7 +661,7 @@ export async function dispatchRequest(
       }
       await cdp.pageCommand(target.id, "Page.navigate", { url: request.url });
       tab.refs = {};
-      return ok(request.id, {
+      return ok({
         url: request.url,
         title: target.title,
         tabId: target.id,
@@ -570,34 +673,34 @@ export async function dispatchRequest(
     case "back": {
       const seq = tab.recordAction();
       await cdp.evaluate(target.id, "history.back(); undefined");
-      return ok(request.id, { tab: shortId, seq });
+      return ok({ tab: shortId, seq });
     }
 
     case "forward": {
       const seq = tab.recordAction();
       await cdp.evaluate(target.id, "history.forward(); undefined");
-      return ok(request.id, { tab: shortId, seq });
+      return ok({ tab: shortId, seq });
     }
 
-    case "refresh": {
+    case "reload": {
       const seq = tab.recordAction();
       await cdp.sessionCommand(target.id, "Page.reload", { ignoreCache: false });
-      return ok(request.id, { tab: shortId, seq });
+      return ok({ tab: shortId, seq });
     }
 
     case "close": {
       const seq = tab.recordAction();
       await cdp.browserCommand("Target.closeTarget", { targetId: target.id });
       tab.refs = {};
-      return ok(request.id, { tab: shortId, seq });
+      return ok({ tab: shortId, seq });
     }
 
     // -----------------------------------------------------------------------
     // Snapshot / observation
     // -----------------------------------------------------------------------
-    case "snapshot": {
+    case "snap": {
       const snapshotData = await buildSnapshot(cdp, target.id, tab, request);
-      return ok(request.id, {
+      return ok({
         title: target.title,
         url: target.url,
         snapshotData,
@@ -606,15 +709,24 @@ export async function dispatchRequest(
     }
 
     case "screenshot": {
+      await cdp.evaluate(target.id, CLEANUP_HIGHLIGHTS_SCRIPT, true).catch(() => {});
       const result = await cdp.sessionCommand<{ data: string }>(
         target.id,
         "Page.captureScreenshot",
         { format: "png", fromSurface: true },
       );
-      return ok(request.id, {
-        dataUrl: `data:image/png;base64,${result.data}`,
+      const dataDir = path.join(process.env.PINIX_HOME || path.join(os.homedir(), ".pinix"), "data", "browser", "screenshots");
+      mkdirSync(dataDir, { recursive: true });
+      const filename = `${Date.now()}.png`;
+      writeFileSync(path.join(dataDir, filename), Buffer.from(result.data, "base64"));
+      const data: Record<string, unknown> = {
+        path: `pinix://browser/screenshots/${filename}`,
         tab: shortId,
-      });
+      };
+      if (request.includeBase64) {
+        data.dataUrl = `data:image/png;base64,${result.data}`;
+      }
+      return ok(data);
     }
 
     // -----------------------------------------------------------------------
@@ -622,27 +734,27 @@ export async function dispatchRequest(
     // -----------------------------------------------------------------------
     case "click":
     case "hover": {
-      if (!request.ref) return fail(request.id, "Missing ref parameter");
+      if (!request.ref) return fail("Missing ref parameter");
       const seq = tab.recordAction();
       const backendNodeId = await parseRef(cdp, target.id, tab, request.ref);
       const point = await getInteractablePoint(cdp, target.id, backendNodeId);
       await cdp.sessionCommand(target.id, "Input.dispatchMouseEvent", {
         type: "mouseMoved", x: point.x, y: point.y, button: "none",
       });
-      if (request.action === "click") {
+      if (request.method === "click") {
         await mouseClick(cdp, target.id, point.x, point.y);
       }
-      return ok(request.id, { tab: shortId, seq });
+      return ok({ tab: shortId, seq });
     }
 
     case "fill":
     case "type": {
-      if (!request.ref) return fail(request.id, "Missing ref parameter");
-      if (request.text == null) return fail(request.id, "Missing text parameter");
+      if (!request.ref) return fail("Missing ref parameter");
+      if (request.text == null) return fail("Missing text parameter");
       const seq = tab.recordAction();
       const backendNodeId = await parseRef(cdp, target.id, tab, request.ref);
-      await insertTextIntoNode(cdp, target.id, backendNodeId, request.text, request.action === "fill");
-      return ok(request.id, {
+      await insertTextIntoNode(cdp, target.id, backendNodeId, request.text, request.method === "fill");
+      return ok({
         value: request.text,
         tab: shortId,
         seq,
@@ -651,9 +763,9 @@ export async function dispatchRequest(
 
     case "check":
     case "uncheck": {
-      if (!request.ref) return fail(request.id, "Missing ref parameter");
+      if (!request.ref) return fail("Missing ref parameter");
       const seq = tab.recordAction();
-      const desired = request.action === "check";
+      const desired = request.method === "check";
       const backendNodeId = await parseRef(cdp, target.id, tab, request.ref);
       const resolved = await cdp.sessionCommand<{ object: { objectId: string } }>(
         target.id,
@@ -664,11 +776,11 @@ export async function dispatchRequest(
         objectId: resolved.object.objectId,
         functionDeclaration: `function() { this.checked = ${desired}; this.dispatchEvent(new Event('input', { bubbles: true })); this.dispatchEvent(new Event('change', { bubbles: true })); }`,
       });
-      return ok(request.id, { tab: shortId, seq });
+      return ok({ tab: shortId, seq });
     }
 
     case "select": {
-      if (!request.ref || request.value == null) return fail(request.id, "Missing ref or value parameter");
+      if (!request.ref || request.value == null) return fail("Missing ref or value parameter");
       const seq = tab.recordAction();
       const backendNodeId = await parseRef(cdp, target.id, tab, request.ref);
       const resolved = await cdp.sessionCommand<{ object: { objectId: string } }>(
@@ -680,7 +792,7 @@ export async function dispatchRequest(
         objectId: resolved.object.objectId,
         functionDeclaration: `function() { this.value = ${JSON.stringify(request.value)}; this.dispatchEvent(new Event('input', { bubbles: true })); this.dispatchEvent(new Event('change', { bubbles: true })); }`,
       });
-      return ok(request.id, {
+      return ok({
         value: request.value,
         tab: shortId,
         seq,
@@ -688,31 +800,31 @@ export async function dispatchRequest(
     }
 
     case "get": {
-      if (!request.attribute) return fail(request.id, "Missing attribute parameter");
+      if (!request.attribute) return fail("Missing attribute parameter");
       if (request.attribute === "url" && !request.ref) {
-        return ok(request.id, {
+        return ok({
           value: await cdp.evaluate<string>(target.id, "location.href", true),
           tab: shortId,
         });
       }
       if (request.attribute === "title" && !request.ref) {
-        return ok(request.id, {
+        return ok({
           value: await cdp.evaluate<string>(target.id, "document.title", true),
           tab: shortId,
         });
       }
-      if (!request.ref) return fail(request.id, "Missing ref parameter");
+      if (!request.ref) return fail("Missing ref parameter");
       const value = await getAttributeValue(
         cdp,
         target.id,
         await parseRef(cdp, target.id, tab, request.ref),
         request.attribute,
       );
-      return ok(request.id, { value, tab: shortId });
+      return ok({ value, tab: shortId });
     }
 
     case "press": {
-      if (!request.key) return fail(request.id, "Missing key parameter");
+      if (!request.key) return fail("Missing key parameter");
       const seq = tab.recordAction();
       await cdp.sessionCommand(target.id, "Input.dispatchKeyEvent", {
         type: "keyDown", key: request.key,
@@ -725,34 +837,42 @@ export async function dispatchRequest(
       await cdp.sessionCommand(target.id, "Input.dispatchKeyEvent", {
         type: "keyUp", key: request.key,
       });
-      return ok(request.id, { tab: shortId, seq });
+      return ok({ tab: shortId, seq });
     }
 
     case "scroll": {
       const seq = tab.recordAction();
-      const deltaY = request.direction === "up"
-        ? -(request.pixels ?? 300)
-        : (request.pixels ?? 300);
+      const pixels = request.pixels ?? 300;
+      let deltaX = 0;
+      let deltaY = 0;
+      switch (request.direction) {
+        case "up": deltaY = -pixels; break;
+        case "down": deltaY = pixels; break;
+        case "left": deltaX = -pixels; break;
+        case "right": deltaX = pixels; break;
+      }
       await cdp.sessionCommand(target.id, "Input.dispatchMouseEvent", {
-        type: "mouseWheel", x: 0, y: 0, deltaX: 0, deltaY,
+        type: "mouseWheel", x: 0, y: 0, deltaX, deltaY,
       });
-      return ok(request.id, { tab: shortId, seq });
-    }
-
-    case "wait": {
-      await new Promise((resolve) => setTimeout(resolve, request.ms ?? 1000));
-      return ok(request.id, { tab: shortId });
+      return ok({ tab: shortId, seq });
     }
 
     case "eval": {
-      if (!request.script) return fail(request.id, "Missing script parameter");
+      // Note: eval with domain routing (no explicit tab) is handled before
+      // ensurePageTarget() above.  This branch handles eval with an explicit
+      // tab, or eval without domain.
+      if (!request.script) return fail("Missing script parameter");
       const seq = tab.recordAction();
-      const result = await cdp.evaluate<unknown>(target.id, request.script, true);
-      return ok(request.id, {
-        result,
-        tab: shortId,
-        seq,
-      });
+
+      // If args are provided, wrap the script in an IIFE that receives them.
+      let script = request.script;
+      if (request.args !== undefined) {
+        const argsJson = JSON.stringify(request.args);
+        script = `(async function(){return (${script})(${argsJson});})()`;
+      }
+
+      const result = await cdp.evaluate<unknown>(target.id, script, true);
+      return ok({ result, tab: shortId, seq });
     }
 
     // -----------------------------------------------------------------------
@@ -771,7 +891,7 @@ export async function dispatchRequest(
           tab: tState?.shortId ?? t.id.slice(-4).toLowerCase(),
         };
       });
-      return ok(request.id, {
+      return ok({
         tabs,
         activeIndex: tabs.findIndex((t) => t.active),
       });
@@ -779,85 +899,11 @@ export async function dispatchRequest(
 
     // tab_new is handled before ensurePageTarget() above
 
-    case "tab_select": {
-      const targets = (await cdp.getTargets()).filter((t) => t.type === "page");
-      let selected: CdpTargetInfo | undefined;
-
-      if (request.tabId !== undefined) {
-        const tabIdStr = String(request.tabId);
-        // Try short ID
-        const resolvedId = cdp.tabManager.resolveShortId(tabIdStr);
-        if (resolvedId) {
-          selected = targets.find((t) => t.id === resolvedId);
-        }
-        // Try full target ID
-        if (!selected) {
-          selected = targets.find((t) => t.id === tabIdStr);
-        }
-        // Try numeric index
-        if (!selected) {
-          const num = Number(tabIdStr);
-          if (!Number.isNaN(num)) {
-            selected = targets[num];
-          }
-        }
-      } else {
-        selected = targets[request.index ?? 0];
-      }
-
-      if (!selected) return fail(request.id, "Tab not found");
-      cdp.currentTargetId = selected.id;
-      await cdp.attachAndEnable(selected.id);
-      const selTab = cdp.tabManager.getTab(selected.id);
-      return ok(request.id, {
-        tabId: selected.id,
-        url: selected.url,
-        title: selected.title,
-        tab: selTab?.shortId,
-      });
-    }
-
-    case "tab_close": {
-      const targets = (await cdp.getTargets()).filter((t) => t.type === "page");
-      let selected: CdpTargetInfo | undefined;
-
-      if (request.tabId !== undefined) {
-        const tabIdStr = String(request.tabId);
-        const resolvedId = cdp.tabManager.resolveShortId(tabIdStr);
-        if (resolvedId) {
-          selected = targets.find((t) => t.id === resolvedId);
-        }
-        if (!selected) {
-          selected = targets.find((t) => t.id === tabIdStr);
-        }
-        if (!selected) {
-          const num = Number(tabIdStr);
-          if (!Number.isNaN(num)) {
-            selected = targets[num];
-          }
-        }
-      } else {
-        selected = targets[request.index ?? 0];
-      }
-
-      if (!selected) return fail(request.id, "Tab not found");
-      const closedTab = cdp.tabManager.getTab(selected.id);
-      const closedShort = closedTab?.shortId;
-      await cdp.browserCommand("Target.closeTarget", { targetId: selected.id });
-      if (cdp.currentTargetId === selected.id) {
-        cdp.currentTargetId = undefined;
-      }
-      return ok(request.id, {
-        tabId: selected.id,
-        tab: closedShort,
-      });
-    }
-
     // -----------------------------------------------------------------------
     // Frame navigation
     // -----------------------------------------------------------------------
     case "frame": {
-      if (!request.selector) return fail(request.id, "Missing selector parameter");
+      if (!request.selector) return fail("Missing selector parameter");
       const seq = tab.recordAction();
       const document = await cdp.pageCommand<{ root: { nodeId: number } }>(
         target.id,
@@ -869,15 +915,15 @@ export async function dispatchRequest(
         "DOM.querySelector",
         { nodeId: document.root.nodeId, selector: request.selector },
       );
-      if (!node.nodeId) return fail(request.id, `iframe not found: ${request.selector}`);
+      if (!node.nodeId) return fail(`iframe not found: ${request.selector}`);
       const described = await cdp.pageCommand<{
         node: { frameId?: string; nodeName?: string; attributes?: string[] };
       }>(target.id, "DOM.describeNode", { nodeId: node.nodeId });
       const frameId = described.node.frameId;
       const nodeName = String(described.node.nodeName ?? "").toLowerCase();
-      if (!frameId) return fail(request.id, `Cannot get iframe frameId: ${request.selector}`);
+      if (!frameId) return fail(`Cannot get iframe frameId: ${request.selector}`);
       if (nodeName && nodeName !== "iframe" && nodeName !== "frame") {
-        return fail(request.id, `Element is not an iframe: ${nodeName}`);
+        return fail(`Element is not an iframe: ${nodeName}`);
       }
       tab.activeFrameId = frameId;
       const attributes = described.node.attributes ?? [];
@@ -885,7 +931,7 @@ export async function dispatchRequest(
       for (let i = 0; i < attributes.length; i += 2) {
         attrMap[String(attributes[i])] = String(attributes[i + 1] ?? "");
       }
-      return ok(request.id, {
+      return ok({
         frameInfo: {
           selector: request.selector,
           name: attrMap.name ?? "",
@@ -900,7 +946,7 @@ export async function dispatchRequest(
     case "frame_main": {
       const seq = tab.recordAction();
       tab.activeFrameId = null;
-      return ok(request.id, {
+      return ok({
         frameInfo: { frameId: 0 },
         tab: shortId,
         seq,
@@ -917,7 +963,7 @@ export async function dispatchRequest(
         ...(request.promptText !== undefined ? { promptText: request.promptText } : {}),
       };
       await cdp.sessionCommand(target.id, "Page.enable");
-      return ok(request.id, {
+      return ok({
         dialogInfo: {
           type: "armed",
           message: `Dialog handler armed: ${request.dialogResponse ?? "accept"}`,
@@ -938,7 +984,7 @@ export async function dispatchRequest(
           const queryResult = tab.getNetworkRequests({
             since: request.since,
             filter: request.filter,
-            method: request.method,
+            method: request.httpMethod,
             status: request.status,
             limit: request.limit,
           });
@@ -964,21 +1010,21 @@ export async function dispatchRequest(
             );
           }
 
-          return ok(request.id, {
+          return ok({
             networkRequests: items,
             tab: shortId,
             cursor: queryResult.cursor,
           });
         }
         case "route":
-          return ok(request.id, { routeCount: 0, tab: shortId });
+          return ok({ routeCount: 0, tab: shortId });
         case "unroute":
-          return ok(request.id, { routeCount: 0, tab: shortId });
+          return ok({ routeCount: 0, tab: shortId });
         case "clear":
           tab.clearNetwork();
-          return ok(request.id, { tab: shortId });
+          return ok({ tab: shortId });
         default:
-          return fail(request.id, `Unknown network subcommand: ${subCommand}`);
+          return fail(`Unknown network subcommand: ${subCommand}`);
       }
     }
 
@@ -994,7 +1040,7 @@ export async function dispatchRequest(
             filter: request.filter,
             limit: request.limit,
           });
-          return ok(request.id, {
+          return ok({
             consoleMessages: queryResult.items,
             tab: shortId,
             cursor: queryResult.cursor,
@@ -1002,9 +1048,9 @@ export async function dispatchRequest(
         }
         case "clear":
           tab.clearConsole();
-          return ok(request.id, { tab: shortId });
+          return ok({ tab: shortId });
         default:
-          return fail(request.id, `Unknown console subcommand: ${subCommand}`);
+          return fail(`Unknown console subcommand: ${subCommand}`);
       }
     }
 
@@ -1020,7 +1066,7 @@ export async function dispatchRequest(
             filter: request.filter,
             limit: request.limit,
           });
-          return ok(request.id, {
+          return ok({
             jsErrors: queryResult.items,
             tab: shortId,
             cursor: queryResult.cursor,
@@ -1028,9 +1074,9 @@ export async function dispatchRequest(
         }
         case "clear":
           tab.clearErrors();
-          return ok(request.id, { tab: shortId });
+          return ok({ tab: shortId });
         default:
-          return fail(request.id, `Unknown errors subcommand: ${subCommand}`);
+          return fail(`Unknown errors subcommand: ${subCommand}`);
       }
     }
 
@@ -1043,36 +1089,83 @@ export async function dispatchRequest(
         case "start":
           traceRecording = true;
           traceEvents.length = 0;
-          return ok(request.id, {
+          return ok({
             traceStatus: { recording: true, eventCount: 0 } satisfies TraceStatus,
             tab: shortId,
           });
         case "stop": {
           traceRecording = false;
-          return ok(request.id, {
+          return ok({
             traceEvents: [...traceEvents],
             traceStatus: { recording: false, eventCount: traceEvents.length } satisfies TraceStatus,
             tab: shortId,
           });
         }
         case "status":
-          return ok(request.id, {
+          return ok({
             traceStatus: { recording: traceRecording, eventCount: traceEvents.length } satisfies TraceStatus,
             tab: shortId,
           });
         default:
-          return fail(request.id, `Unknown trace subcommand: ${subCommand}`);
+          return fail(`Unknown trace subcommand: ${subCommand}`);
       }
     }
 
     // -----------------------------------------------------------------------
-    // History (not implemented in daemon yet)
+    // Site adapters
     // -----------------------------------------------------------------------
-    case "history": {
-      return fail(request.id, "History command is not supported in daemon mode");
+    case "site_list": {
+      const sites = getAllSites();
+      return ok({
+        sites: sites.map(s => ({
+          name: s.name, description: s.description, domain: s.domain, source: s.source,
+        })),
+      } as ExtResponseData);
+    }
+
+    case "site_info": {
+      const name = request.siteName;
+      if (!name) return fail("Missing siteName");
+      const sites = getAllSites();
+      const site = sites.find(s => s.name === name);
+      if (!site) return fail(`Site adapter "${name}" not found`);
+      return ok({
+        name: site.name, description: site.description, domain: site.domain,
+        args: site.args, example: site.example, readOnly: site.readOnly,
+      } as ExtResponseData);
+    }
+
+    case "site_search": {
+      const query = (request.query || "").toLowerCase();
+      const sites = getAllSites();
+      const matches = sites.filter(s =>
+        s.name.toLowerCase().includes(query) ||
+        s.description?.toLowerCase().includes(query) ||
+        s.domain?.toLowerCase().includes(query),
+      );
+      return ok({
+        sites: matches.map(s => ({
+          name: s.name, description: s.description, domain: s.domain, source: s.source,
+        })),
+      } as ExtResponseData);
+    }
+
+    case "site_run": {
+      const name = request.siteName;
+      const args = request.siteArgs || {};
+      if (!name) return fail("Missing siteName");
+      try {
+        const result = await executeSiteAdapter(cdp, name, args, request.tabId);
+        return ok({
+          tab: result.tab,
+          result: result.result,
+        } as ExtResponseData);
+      } catch (error) {
+        return fail(error);
+      }
     }
 
     default:
-      return fail(request.id, `Unknown action: ${request.action}`);
+      return fail(`Unknown method: ${request.method}`);
   }
 }
