@@ -34,7 +34,10 @@ export type ActionType =
   | "site_run"
   | "site_list"
   | "site_info"
-  | "site_search";
+  | "site_search"
+  | "goto"
+  | "cookies"
+  | "source";
 
 /** 请求类型 */
 export interface Request {
@@ -74,8 +77,16 @@ export interface Request {
   dialogResponse?: "accept" | "dismiss";
   /** prompt 对话框的输入文本（dialog accept 时可选） */
   promptText?: string;
-  /** network 子命令：requests, route, unroute, clear */
-  networkCommand?: "requests" | "route" | "unroute" | "clear";
+  /** Sub-command action (used by network, console, errors, trace, source) */
+  action?: string;
+  /** Search pattern (used by source grep) */
+  pattern?: string;
+  /** @deprecated Use action instead */ networkCommand?: string;
+  /** @deprecated Use action instead */ consoleCommand?: string;
+  /** @deprecated Use action instead */ errorsCommand?: string;
+  /** @deprecated Use action instead */ traceCommand?: string;
+  /** @deprecated Use action instead */ sourceCommand?: string;
+  /** @deprecated Use pattern instead */ sourcePattern?: string;
   /** network route 选项 */
   routeOptions?: {
     abort?: boolean;
@@ -87,12 +98,10 @@ export interface Request {
   filter?: string;
   /** network requests 是否包含 body/headers */
   withBody?: boolean;
-  /** console 子命令：get, clear */
-  consoleCommand?: "get" | "clear";
-  /** errors 子命令：get, clear */
-  errorsCommand?: "get" | "clear";
-  /** trace 子命令：start, stop, status */
-  traceCommand?: "start" | "stop" | "status";
+  /** Request ID for trace body command */
+  requestId?: string;
+  /** Event type filter for trace events (action/request/response/navigation) */
+  traceType?: string;
   /** 按键名（press 命令使用） */
   key?: string;
   /** 修饰键列表（press 命令使用） */
@@ -117,6 +126,9 @@ export interface Request {
   query?: string;
   /** 是否包含 base64 数据（screenshot 命令使用） */
   includeBase64?: boolean;
+  /** 排除静态资源（trace events / network requests 使用） */
+  excludeStatic?: boolean;
+  // sourceCommand and sourcePattern are declared above with other deprecated aliases
 }
 
 /** 元素引用信息 */
@@ -198,49 +210,91 @@ export interface JSErrorInfo {
   timestamp: number;
 }
 
-/** Trace 事件类型 - 录制用户操作 */
-export interface TraceEvent {
-  /** 事件类型 */
-  type: 'click' | 'fill' | 'select' | 'check' | 'press' | 'scroll' | 'navigation';
-  /** 时间戳 */
-  timestamp: number;
-  /** 事件发生时的页面 URL */
-  url: string;
-  
-  /** 元素引用 - highlightIndex，可直接用于 @ref */
-  ref?: number;
-  /** 备用定位 - XPath */
-  xpath?: string;
-  /** CSS 选择器 */
-  cssSelector?: string;
-  
-  /** 操作参数 - fill/select 的值 */
-  value?: string;
-  /** 操作参数 - press 的按键 */
-  key?: string;
-  /** 操作参数 - scroll 方向 */
-  direction?: 'up' | 'down' | 'left' | 'right';
-  /** 操作参数 - scroll 距离 */
-  pixels?: number;
-  /** 操作参数 - check/uncheck 状态 */
-  checked?: boolean;
-  
-  /** 语义信息 - 元素角色 */
-  elementRole?: string;
-  /** 语义信息 - 元素名称 */
-  elementName?: string;
-  /** 语义信息 - 元素标签 */
-  elementTag?: string;
+// ---------------------------------------------------------------------------
+// Trace — unified timeline of actions + network + navigation
+// ---------------------------------------------------------------------------
+
+/** Base fields shared by all trace entries */
+interface TraceEntryBase {
+  /** Global monotonic seq */
+  seq: number;
+  /** Millisecond timestamp (Date.now()) */
+  ts: number;
+  /** Tab shortId where the event occurred */
+  tab: string;
 }
 
-/** Trace 录制状态 */
+/** User action (bb-browser command or human interaction) */
+export interface TraceAction extends TraceEntryBase {
+  type: 'action';
+  /** Whether this action came from a bb-browser command or human interaction */
+  source: 'command' | 'human';
+  /** Action name: click, fill, type, press, scroll, select, check, open, ... */
+  action: string;
+  /** Element ref from snapshot */
+  ref?: number;
+  /** CSS selector (for human-captured events) */
+  selector?: string;
+  /** Visible text of the target element (truncated) */
+  text?: string;
+  /** Accessibility role */
+  role?: string;
+  /** HTML tag name */
+  tag?: string;
+  /** Input value (fill/type) */
+  value?: string;
+  /** Key name (press) */
+  key?: string;
+  /** Scroll direction */
+  direction?: string;
+  /** URL (for open/navigation actions) */
+  url?: string;
+}
+
+/** Network request sent */
+export interface TraceRequest extends TraceEntryBase {
+  type: 'request';
+  requestId: string;
+  method: string;
+  url: string;
+  /** Resource type: XHR, Fetch, Document, Script, ... */
+  resourceType: string;
+  headers?: Record<string, string>;
+  /** POST body */
+  body?: string;
+  /** Seq of the action that likely triggered this request */
+  triggerSeq?: number;
+}
+
+/** Network response received */
+export interface TraceResponse extends TraceEntryBase {
+  type: 'response';
+  /** Matches TraceRequest.requestId */
+  requestId: string;
+  status: number;
+  mimeType?: string;
+  bodySize?: number;
+}
+
+/** Page navigation */
+export interface TraceNavigation extends TraceEntryBase {
+  type: 'navigation';
+  url: string;
+  /** URL before navigation */
+  from?: string;
+}
+
+/** Union of all trace entry types */
+export type TraceEntry = TraceAction | TraceRequest | TraceResponse | TraceNavigation;
+
+/** Trace session status */
 export interface TraceStatus {
-  /** 是否正在录制 */
+  /** Whether recording is active */
   recording: boolean;
-  /** 已录制事件数量 */
+  /** Total event count in the timeline */
   eventCount: number;
-  /** 录制的标签页 ID */
-  tabId?: number;
+  /** Tabs being traced */
+  tracedTabs?: string[];
 }
 
 /** 响应数据 */
@@ -299,10 +353,16 @@ export interface ResponseData {
   consoleMessages?: ConsoleMessageInfo[];
   /** JS 错误列表（errors 命令返回） */
   jsErrors?: JSErrorInfo[];
-  /** Trace 事件列表（trace stop 命令返回） */
-  traceEvents?: TraceEvent[];
-  /** Trace 录制状态（trace status 命令返回） */
+  /** Trace timeline entries (trace events/stop command) */
+  traceEvents?: TraceEntry[];
+  /** Trace session status */
   traceStatus?: TraceStatus;
+  /** Trace response body (trace body command) */
+  traceBody?: { requestId: string; body: string; base64Encoded: boolean; requestBody?: string };
+  /** Cookies for the current page (cookies command) */
+  cookies?: Array<{ name: string; value: string; domain: string; path: string; expires: number; httpOnly: boolean; secure: boolean }>;
+  /** Source grep results (source command) */
+  sourceResults?: Array<{ url: string; matches: string[] }>;
 }
 
 /** 错误信息 */

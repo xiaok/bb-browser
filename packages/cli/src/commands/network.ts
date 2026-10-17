@@ -14,6 +14,7 @@ interface NetworkOptions {
   since?: string;
   method?: string;
   status?: string;
+  excludeStatic?: boolean;
 }
 
 export async function networkCommand(
@@ -29,7 +30,7 @@ export async function networkCommand(
 
   const request: Request = {
     method: "network",
-    networkCommand: subCommand as "requests" | "route" | "unroute" | "clear",
+    action: subCommand as "requests" | "route" | "unroute" | "clear",
     url: subCommand === "route" || subCommand === "unroute" ? urlOrFilter : undefined,
     filter: subCommand === "requests" ? urlOrFilter : undefined,
     routeOptions: subCommand === "route" ? {
@@ -37,6 +38,7 @@ export async function networkCommand(
       body: options.body,
     } : undefined,
     withBody: subCommand === "requests" ? options.withBody : undefined,
+    excludeStatic: subCommand === "requests" ? options.excludeStatic : undefined,
     since,
     httpMethod: subCommand === "requests" ? options.method : undefined,
     status: subCommand === "requests" ? options.status : undefined,

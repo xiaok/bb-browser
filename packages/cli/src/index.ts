@@ -3,6 +3,7 @@
  */
 
 import { openCommand } from "./commands/open.js";
+import { gotoCommand } from "./commands/goto.js";
 import { snapshotCommand } from "./commands/snapshot.js";
 import { clickCommand } from "./commands/click.js";
 import { hoverCommand } from "./commands/hover.js";
@@ -24,6 +25,8 @@ import { networkCommand } from "./commands/network.js";
 import { consoleCommand } from "./commands/console.js";
 import { errorsCommand } from "./commands/errors.js";
 import { traceCommand } from "./commands/trace.js";
+import { cookiesCommand } from "./commands/cookies.js";
+import { sourceCommand as sourceCmd } from "./commands/source.js";
 import { siteCommand } from "./commands/site.js";
 import { shutdownCommand, startCommand, statusCommand } from "./commands/daemon.js";
 import { getDaemonPath } from "./daemon-manager.js";
@@ -38,7 +41,8 @@ const TAB_REQUIRED_COMMANDS = new Set([
   "snap", "screenshot", "get",
   "click", "hover", "fill", "type", "check", "uncheck", "select",
   "press", "scroll", "back", "forward", "reload", "close",
-  "frame", "dialog", "network", "console", "errors", "trace",
+  "frame", "dialog", "network", "console", "errors",
+  "goto", "cookies", "source",
 ]);
 
 // eval requires --tab unless --domain is provided
@@ -67,7 +71,8 @@ bb-browser - AI Agent 浏览器自动化工具
   star                         ⭐ Star bb-browser on GitHub
 
 浏览器操作：
-  open <url> [--tab]           打开 URL
+  open <url> [--tab]           打开 URL（新 tab 或指定 tab）
+  goto <url> --tab <id>        在当前 tab 导航到新 URL（保持上下文）
   snap [-i] [-c] [-d <n>]     获取页面快照 (--tab required)
   click <ref>                  点击元素 (--tab required)
   hover <ref>                  悬停元素 (--tab required)
@@ -93,9 +98,15 @@ bb-browser - AI Agent 浏览器自动化工具
 
 调试：
   network requests [filter]    查看网络请求 (--tab required)
+  cookies [--filter <str>]     查看页面 cookies (--tab required)
+  source grep <pattern>        搜索已加载 JS 源码 (--tab required)
   console [--clear]            查看/清空控制台 (--tab required)
   errors [--clear]             查看/清空 JS 错误 (--tab required)
-  trace start|stop|status      录制用户操作 (--tab required)
+  trace start [--tab <id>]     录制操作+网络的统一时间线
+  trace events [--type action|request] 查看时间线（支持 --since/--filter/--tab）
+  trace body <requestId>       获取某个请求的 response body
+  trace stop                   停止录制（数据保留）
+  trace status                 查看录制状态
   daemon [start|status|stop]   管理 daemon
 
 选项：
@@ -108,6 +119,12 @@ bb-browser - AI Agent 浏览器自动化工具
   -d, --depth <n>      限制树深度（snap 命令）
   -s, --selector <sel> 限定 CSS 选择器范围（snap 命令）
   --tab <tabId>        指定操作的标签页 ID
+  --since <seq>        增量查询（network/console/errors/trace events）
+  --type <t>           过滤事件类型（trace events: action/request/response）
+  --filter <str>       URL 或文字过滤（trace events/network requests/cookies）
+  --exclude-static     排除静态资源（trace events/network requests）
+  --limit <n>          限制返回条数
+  --request-id <id>    请求 ID（trace body）
   --help, -h           显示帮助信息
   --version, -v        显示版本号
 `.trim();
@@ -220,6 +237,32 @@ function parseArgs(argv: string[]): ParsedArgs {
       skipNext = true;
     } else if (arg === "--status") {
       skipNext = true;
+    } else if (arg === "--type") {
+      skipNext = true;
+      const nextIdx = args.indexOf(arg) + 1;
+      if (nextIdx < args.length) {
+        (result.flags as Record<string, unknown>).type = args[nextIdx];
+      }
+    } else if (arg === "--filter") {
+      skipNext = true;
+      const nextIdx = args.indexOf(arg) + 1;
+      if (nextIdx < args.length) {
+        (result.flags as Record<string, unknown>).filter = args[nextIdx];
+      }
+    } else if (arg === "--limit") {
+      skipNext = true;
+      const nextIdx = args.indexOf(arg) + 1;
+      if (nextIdx < args.length) {
+        (result.flags as Record<string, unknown>).limit = parseInt(args[nextIdx], 10);
+      }
+    } else if (arg === "--request-id") {
+      skipNext = true;
+      const nextIdx = args.indexOf(arg) + 1;
+      if (nextIdx < args.length) {
+        (result.flags as Record<string, unknown>)["request-id"] = args[nextIdx];
+      }
+    } else if (arg === "--exclude-static") {
+      (result.flags as Record<string, unknown>).excludeStatic = true;
     } else if (arg.startsWith("-")) {
       // Unknown flags, ignore
     } else if (result.command === null) {
@@ -293,6 +336,16 @@ async function main(): Promise<void> {
         const tabIndex = process.argv.findIndex(a => a === "--tab");
         const tab = tabIndex >= 0 ? process.argv[tabIndex + 1] : undefined;
         await openCommand(url, { json: parsed.flags.json, tab });
+        break;
+      }
+
+      case "goto": {
+        const gotoUrl = parsed.args[0];
+        if (!gotoUrl) {
+          console.error("用法：bb-browser goto <url> --tab <tabId>");
+          process.exit(1);
+        }
+        await gotoCommand(gotoUrl, { json: parsed.flags.json, tabId: globalTabId });
         break;
       }
 
@@ -542,7 +595,8 @@ async function main(): Promise<void> {
         const method = methodIndex >= 0 ? process.argv[methodIndex + 1] : undefined;
         const statusIndex = process.argv.findIndex(a => a === "--status");
         const statusFilter = statusIndex >= 0 ? process.argv[statusIndex + 1] : undefined;
-        await networkCommand(subCommand, urlOrFilter, { json: parsed.flags.json, abort, body, withBody, tabId: globalTabId, since: globalSince, method, status: statusFilter });
+        const excludeStatic = process.argv.includes("--exclude-static");
+        await networkCommand(subCommand, urlOrFilter, { json: parsed.flags.json, abort, body, withBody, tabId: globalTabId, since: globalSince, method, status: statusFilter, excludeStatic });
         break;
       }
 
@@ -558,13 +612,44 @@ async function main(): Promise<void> {
         break;
       }
 
-      case "trace": {
-        const subCmd = parsed.args[0] as 'start' | 'stop' | 'status' | undefined;
-        if (!subCmd || !['start', 'stop', 'status'].includes(subCmd)) {
-          console.error("用法：bb-browser trace <start|stop|status> --tab <tabId>");
+      case "cookies": {
+        const f = parsed.flags as Record<string, unknown>;
+        await cookiesCommand({
+          json: parsed.flags.json,
+          tabId: globalTabId,
+          filter: f.filter as string | undefined,
+        });
+        break;
+      }
+
+      case "source": {
+        const srcSubCmd = parsed.args[0];
+        const srcPattern = parsed.args[1];
+        if (!srcSubCmd || !srcPattern) {
+          console.error("用法：bb-browser source grep <pattern> --tab <tabId>");
           process.exit(1);
         }
-        await traceCommand(subCmd, { json: parsed.flags.json, tabId: globalTabId });
+        await sourceCmd(srcSubCmd, srcPattern, { json: parsed.flags.json, tabId: globalTabId });
+        break;
+      }
+
+      case "trace": {
+        const subCmd = parsed.args[0] as 'start' | 'stop' | 'status' | 'events' | 'body' | undefined;
+        if (!subCmd || !['start', 'stop', 'status', 'events', 'body'].includes(subCmd)) {
+          console.error("用法：bb-browser trace <start|stop|status|events|body> [--tab <tabId>]");
+          process.exit(1);
+        }
+        const f = parsed.flags as Record<string, unknown>;
+        await traceCommand(subCmd, {
+          json: parsed.flags.json,
+          tabId: globalTabId,
+          since: globalSince,
+          type: f.type as string | undefined,
+          filter: f.filter as string | undefined,
+          limit: f.limit as number | undefined,
+          requestId: (f["request-id"] as string | undefined) || parsed.args[1],
+          excludeStatic: f.excludeStatic as boolean | undefined,
+        });
         break;
       }
 

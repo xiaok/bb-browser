@@ -50,6 +50,15 @@ export const COMMANDS: CommandDef[] = [
     },
   },
   {
+    method: "goto", group: "navigate",
+    description: "Navigate current tab to a URL (keeps tab context)",
+    requiresTab: true,
+    params: {
+      url: { type: "string", required: true, position: 0, description: "URL to navigate to" },
+      tab: { type: "string", required: false, description: "Tab ID" },
+    },
+  },
+  {
     method: "back", group: "navigate",
     description: "Navigate back in browser history",
     requiresTab: true,
@@ -308,13 +317,14 @@ export const COMMANDS: CommandDef[] = [
     description: "Inspect or manage network activity. Supports incremental queries with since.",
     requiresTab: true,
     params: {
-      networkCommand: { type: "string", required: false, position: 0, description: "Network sub-command (requests/route/unroute/clear)", default: "requests" },
+      action: { type: "string", required: false, position: 0, description: "Sub-command: requests (default), route, unroute, clear", default: "requests" },
       filter: { type: "string", required: false, description: "URL substring filter for requests" },
       since: { type: "string", required: false, description: "Incremental query: 'last_action' for events since last operation, or a seq number" },
       method: { type: "string", required: false, description: "Filter by HTTP method (GET, POST, etc.)" },
       status: { type: "string", required: false, description: "Filter by status: '4xx', '5xx', or exact code like '200'" },
       limit: { type: "number", required: false, description: "Max number of results to return" },
       withBody: { type: "boolean", required: false, description: "Include request and response bodies" },
+      excludeStatic: { type: "boolean", required: false, description: "Exclude static assets (.js, .css, .png, etc.)" },
       tab: { type: "string", required: true, description: "Tab short ID" },
     },
   },
@@ -323,7 +333,7 @@ export const COMMANDS: CommandDef[] = [
     description: "Get or clear console messages from the page",
     requiresTab: true,
     params: {
-      consoleCommand: { type: "string", required: false, description: "Console sub-command (get or clear)", default: "get" },
+      action: { type: "string", required: false, description: "Sub-command: get (default) or clear", default: "get" },
       filter: { type: "string", required: false, description: "Filter console messages by text substring" },
       since: { type: "string", required: false, description: "Incremental query: 'last_action' for events since last operation, or a seq number" },
       limit: { type: "number", required: false, description: "Max number of results to return" },
@@ -335,7 +345,7 @@ export const COMMANDS: CommandDef[] = [
     description: "Get or clear JavaScript errors from the page",
     requiresTab: true,
     params: {
-      errorsCommand: { type: "string", required: false, description: "Errors sub-command (get or clear)", default: "get" },
+      action: { type: "string", required: false, description: "Sub-command: get (default) or clear", default: "get" },
       filter: { type: "string", required: false, description: "Filter errors by text substring" },
       since: { type: "string", required: false, description: "Incremental query: 'last_action' for events since last operation, or a seq number" },
       limit: { type: "number", required: false, description: "Max number of results to return" },
@@ -344,11 +354,36 @@ export const COMMANDS: CommandDef[] = [
   },
   {
     method: "trace", group: "debug",
-    description: "Record user interactions for replay or code generation",
+    description: "Record a unified timeline of actions + network requests for site adapter creation",
+    requiresTab: false,
+    params: {
+      action: { type: "string", required: true, position: 0, description: "Sub-command: start, stop, status, events, body" },
+      tab: { type: "string", required: false, description: "Tab short ID (start: trace only this tab; events: filter by tab)" },
+      since: { type: "string", required: false, description: "Incremental query cursor (seq number)" },
+      type: { type: "string", required: false, description: "Filter by event type: action, request, response, navigation" },
+      filter: { type: "string", required: false, description: "URL or text substring filter" },
+      limit: { type: "number", required: false, description: "Max number of events to return" },
+      requestId: { type: "string", required: false, description: "Request ID (for trace body)" },
+      excludeStatic: { type: "boolean", required: false, description: "Exclude static assets (.js, .css, .png, etc.)" },
+    },
+  },
+  {
+    method: "cookies", group: "debug",
+    description: "List cookies for the current page",
     requiresTab: true,
     params: {
-      traceCommand: { type: "string", required: true, position: 0, description: "Trace sub-command (start/stop/status)" },
-      tab: { type: "string", required: true, description: "Tab short ID" },
+      tab: { type: "string", required: false, description: "Tab ID" },
+      filter: { type: "string", required: false, description: "Filter by cookie name or domain" },
+    },
+  },
+  {
+    method: "source", group: "debug",
+    description: "Search loaded JavaScript sources (e.g. source grep '/api/')",
+    requiresTab: true,
+    params: {
+      action: { type: "string", required: true, position: 0, description: "Sub-command: grep" },
+      pattern: { type: "string", required: true, position: 1, description: "Search pattern (string or regex)" },
+      tab: { type: "string", required: false, description: "Tab ID" },
     },
   },
 ];

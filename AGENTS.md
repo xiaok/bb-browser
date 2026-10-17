@@ -79,8 +79,25 @@ bb-browser daemon start --hub https://hub.pinixai.com --hub-token xxx
 | 交互 | `click/hover/fill/type/press/scroll/check/uncheck/select --tab` |
 | Tab | `tab list`, `tab new [url]` |
 | Site | `site list`, `site info <name>`, `site run <name>` |
-| 调试 | `network/console/errors/trace --tab` |
+| 调试 | `network/console/errors/trace/cookies/source --tab` |
 | 进程 | `daemon start [--hub]`, `daemon stop`, `daemon status` |
+
+### Debug 命令参数约定
+
+Debug 命令（`network`, `console`, `errors`, `trace`, `source`）有子命令的统一用 `--action` 参数：
+
+```bash
+# CLI 用法（位置参数）
+bb-browser source grep "api.example" --tab <id>
+bb-browser trace start --tab <id>
+
+# Hub invoke 用法（命名参数）
+pinix invoke browser source --action grep --pattern "api.example" --tab <id>
+pinix invoke browser trace --action start --tab <id>
+pinix invoke browser network --action requests --excludeStatic true --tab <id>
+```
+
+旧参数名（`sourceCommand`、`traceCommand` 等）仍可用但已 deprecated。
 
 ## 设计不变量
 
@@ -146,28 +163,35 @@ Chrome 始终以有头模式启动，不使用 `--headless=new`。macOS 上没�
 ### Docker 构建
 
 ```bash
-# 前置：下载 Chrome for Testing 到 bin/（gitignored）
-curl -L -o bin/chrome-linux64.zip \
-  "https://storage.googleapis.com/chrome-for-testing-public/149.0.7827.22/linux64/chrome-linux64.zip"
-
-# 构建（Dockerfile 已配置阿里云 apt/Go/npm 镜像）
+# 构建（单阶段，下载预编译 bb-viewer + Chrome，阿里云 apt/npm 镜像）
 docker build --platform linux/amd64 -t bb-browser:amd64 .
 
-# 运行
+# 运行（TURN 凭证自动从 Hub API 获取，不需要配置）
 docker run -d --platform linux/amd64 --name bb-browser \
   -v bb-browser-data:/data -p 19825:19824 --shm-size=2g \
-  -e TURN_URL=turn:<host>:3478 \
-  -e TURN_SECRET=<secret> \
   -e CHROME_WINDOW_SIZE=1280,720 \
   bb-browser:amd64 --host 0.0.0.0 \
   --hub https://hub.pinixai.com --hub-token <token>
 ```
 
-镜像内预装了 Chrome for Testing，运行时无需下载。`--shm-size=2g` 防止 Chrome 因共享内存不足 crash。
+镜像内预装了 Chrome for Testing + bb-viewer（静态链接），运行时无需下载。
+`--shm-size=2g` 防止 Chrome 因共享内存不足 crash。
+TURN 环境变量（`TURN_URL`/`TURN_SECRET`）仍可用于覆盖默认值。
 
-### bb-viewer (streamer) 解码器
+**推荐：使用 Pinix 全家桶镜像 `lueco/pinix`，包含 pinixd + bb-browser + Chrome，一个 token 启动一切。**
 
-JPEG → I420 解码使用 `tjDecompress2` (RGB) 再手动转 I420，而非 `tjDecompressToYUVPlanes`。后者在 libturbojpeg 2.1.x 上对奇数高度帧有 chroma plane 计算 bug。Chrome headless 在 Linux 上的 viewport 高度经常是奇数（如 577），decoder 会自动 round down 到偶数。
+### bb-viewer (streamer)
+
+- 预编译 binary 在 COS 上，daemon 首次 stream 时自动下载（`~/.bb-browser/bin/bb-viewer`）
+- 静态链接 libvpx + libturbojpeg，不依赖用户系统库版本
+- JPEG → I420 解码使用 `tjDecompress2` (RGB) 再手动转 I420，而非 `tjDecompressToYUVPlanes`（后者在 libturbojpeg 2.1.x 对奇数高度帧有 bug）
+- Decoder 自动 round down 到偶数尺寸
+
+### TURN relay
+
+TURN 凭证通过 Hub API `GET /turn/credentials` 动态获取（24h TTL），secret 只在服务端。
+daemon 启动 streamer 时自动请求，不需要用户配置。
+环境变量 `TURN_URL` / `TURN_SECRET` 可覆盖（standalone 模式）。
 
 ## 代码规范
 
